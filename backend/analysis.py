@@ -45,6 +45,8 @@ def analyze_identity_stream(inputs, username="", max_sites=None, workers=None):
         try:
             for result in search_public_web_stream(**inputs, username=username):
                 messages.put(("web", result, None, time.perf_counter() - source_started))
+            if result and result.get("failed_queries") and result["failed_queries"] == result.get("queries_total"):
+                error = "All public-web provider queries failed."
         except Exception as exc:
             error = str(exc)
         messages.put(("web_done", result, error, time.perf_counter() - source_started))

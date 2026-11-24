@@ -11,6 +11,19 @@ INPUTS = dict(full_name="Example Person", location="", email="", phone="")
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_all_provider_queries_failed_preserves_username_results(self):
+        web = {"queries_total": 2, "queries_completed": 2, "failed_queries": 2, "results": []}
+        profiles = {"sites_total": 1, "sites_checked": 1, "found_count": 1}
+        with patch("backend.analysis.search_public_web_stream", return_value=iter([web])), patch(
+            "backend.analysis.scan_username_stream", return_value=iter([profiles])
+        ):
+            final = list(analyze_identity_stream(INPUTS, "example"))[-1]
+        self.assertEqual(final["web_error"], "All public-web provider queries failed.")
+        self.assertEqual(final["web"], web)
+        self.assertEqual(final["profiles"], profiles)
+        self.assertTrue(final["web_done"] and final["username_done"])
+        self.assertIsNone(final["username_error"])
+
     def test_sources_overlap_and_deliver_match_before_either_finishes(self):
         web_started, web_release, username_release = Event(), Event(), Event()
 

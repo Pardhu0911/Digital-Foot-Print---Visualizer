@@ -1,17 +1,21 @@
-from ddgs import DDGS
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
+import json
 import re
+from time import perf_counter
 import unicodedata
 from urllib.parse import unquote, urlparse
+
+import ddgs
+from ddgs import DDGS
+from ddgs.exceptions import RatelimitException, TimeoutException
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-SEARCH_BACKEND = "bing"
+SEARCH_BACKEND = "auto"
 DEFAULT_RESULTS_PER_QUERY = 10
 SEARCH_TIMEOUT = 12
 
@@ -231,114 +235,62 @@ def build_queries(
 # ============================================================
 
 def _classify_error(error):
-    """Convert DDGS/Bing errors into useful statuses."""
-
-    error_text = str(error).lower()
-
-    if (
-        "no results" in error_text
-        or "no result" in error_text
-    ):
-        return "no_results"
-
-    if (
-        "429" in error_text
-        or "rate limit" in error_text
-        or "too many requests" in error_text
+    """Recognize definite errors and DDGS's standard no-results response."""
+    error_text = str(error).strip().lower()
+    if isinstance(error, RatelimitException) or any(
+        hint in error_text for hint in ("429", "rate limit", "too many requests")
     ):
         return "rate_limited"
-
-    if (
-        "timeout" in error_text
-        or "timed out" in error_text
+    if isinstance(error, (TimeoutException, TimeoutError)) or any(
+        hint in error_text for hint in ("timeout", "timed out")
     ):
         return "timeout"
-
+    if error_text.rstrip(".") in {"no result", "no results", "no results found"}:
+        return "no_results"
     return "error"
 
 
-# ============================================================
-# BING SEARCH
-# ============================================================
+def _query_failure(error):
+    status = _classify_error(error)
+    result = {
+        "status": status, "result_count": 0, "results": [],
+        "exception_class": type(error).__name__, "exception_message": str(error),
+    }
+    if status != "no_results":
+        result["error"] = str(error)
+    return result
 
-def search_query(
-    query,
-    max_results=DEFAULT_RESULTS_PER_QUERY,
-):
-    """
-    Execute one live Bing search through DDGS.
-    """
 
+def search_query(query, max_results=DEFAULT_RESULTS_PER_QUERY):
+    """Run one query through DDGS and record the provider response before filtering."""
+    started = perf_counter()
+    result = {"query": query, "raw_result_count": 0}
     try:
-
-        results = DDGS(
-            timeout=SEARCH_TIMEOUT
-        ).text(
-            query,
-            region="us-en",
-            safesearch="moderate",
-            max_results=max_results,
-            backend=SEARCH_BACKEND,
-        )
-
+        rows = list(DDGS(timeout=SEARCH_TIMEOUT).text(
+            query, region="us-en", safesearch="moderate",
+            max_results=max_results, backend=SEARCH_BACKEND,
+        ) or [])
+        result["raw_result_count"] = len(rows)
         normalized_results = []
-
-        for item in results or []:
-
-            url = _clean(
-                item.get("href", "")
-            )
-
+        for item in rows:
+            url = _clean(item.get("href", ""))
             if not url:
                 continue
-
             normalized_results.append({
-                "title": _clean(
-                    item.get("title", "")
-                ),
+                "title": _clean(item.get("title", "")),
                 "url": url,
                 "domain": _get_domain(url),
-                "snippet": _clean(
-                    item.get("body", "")
-                ),
-                "search_engine": "bing",
+                "snippet": _clean(item.get("body", "")),
+                "search_engine": f"DDGS ({SEARCH_BACKEND})",
             })
-
-        if not normalized_results:
-
-            return {
-                "status": "no_results",
-                "query": query,
-                "result_count": 0,
-                "results": [],
-            }
-
-        return {
-            "status": "success",
-            "query": query,
-            "result_count":
-                len(normalized_results),
-            "results":
-                normalized_results,
-        }
-
-    except Exception as error:
-
-        status = _classify_error(
-            error
+        result.update(
+            status="success" if normalized_results else "no_results",
+            result_count=len(normalized_results), results=normalized_results,
         )
-
-        result = {
-            "status": status,
-            "query": query,
-            "result_count": 0,
-            "results": [],
-        }
-
-        if status != "no_results":
-            result["error"] = str(error)
-
-        return result
+    except Exception as error:
+        result.update(_query_failure(error))
+    result["elapsed_seconds"] = round(perf_counter() - started, 3)
+    return result
 
 
 # ============================================================
@@ -413,7 +365,8 @@ def _aggregate_searches(searches, queries_total, warnings, identifiers):
                 continue
             if url not in unique_results:
                 unique_results[url] = {
-                    "source": "Public Web Search", "search_engine": "Bing",
+                    "source": "Public Web Search",
+                    "search_engine": item.get("search_engine") or f"DDGS ({SEARCH_BACKEND})",
                     "title": item.get("title", ""), "url": url,
                     "domain": item.get("domain", ""), "snippet": item.get("snippet", ""),
                     "query_types": [search["query_type"]], "queries": [search["query"]],
@@ -435,7 +388,7 @@ def _aggregate_searches(searches, queries_total, warnings, identifiers):
     successful = sum(row["status"] == "success" for row in searches)
     empty = sum(row["status"] == "no_results" for row in searches)
     return deepcopy({
-        "source": "Public Web Search", "search_engine": "Bing",
+        "source": "Public Web Search", "search_engine": f"DDGS ({SEARCH_BACKEND})",
         "queries_total": queries_total, "queries_completed": len(searches),
         "queries_run": len(searches), "queries_with_results": successful,
         "no_result_queries": empty, "failed_queries": len(searches) - successful - empty,
@@ -451,7 +404,7 @@ def search_identity_stream(
 ):
     """Yield an initial record and one record per concurrently completed query.
 
-    At most three independent Bing searches run at once. Raw provider rows,
+    At most three independent DDGS searches run at once. Provider rows,
     including filtered rows, stay in search diagnostics. Supported pages are
     candidate evidence only; this gate never establishes account ownership.
     """
@@ -471,23 +424,46 @@ def search_identity_stream(
     yield _aggregate_searches(searches, len(queries), warnings, identifiers)
     if not queries:
         return
+    print(f"public_web_backend ddgs_version={ddgs.__version__} backend={SEARCH_BACKEND}", flush=True)
+    provider_empty = 0
     with ThreadPoolExecutor(max_workers=3, thread_name_prefix="public-web-query") as executor:
         futures = {
-            executor.submit(search_query, query_info["query"], max_results_per_query): (index, query_info)
+            executor.submit(search_query, query_info["query"], max_results_per_query): (
+                index, query_info, perf_counter(),
+            )
             for index, query_info in enumerate(queries)
         }
         for future in as_completed(futures):
-            index, query_info = futures[future]
+            index, query_info, submitted = futures[future]
             try:
                 result = dict(future.result())
             except Exception as error:
-                status = _classify_error(error)
-                result = {"status": status, "result_count": 0, "results": []}
-                if status != "no_results":
-                    result["error"] = str(error)
+                result = _query_failure(error)
+            raw_count = result.pop("raw_result_count", result["result_count"])
+            elapsed = result.pop("elapsed_seconds", round(perf_counter() - submitted, 3))
+            exception_class = result.pop("exception_class", None)
+            exception_message = result.pop("exception_message", None)
             result.update(query=query_info["query"], query_type=query_info["type"], plan_index=index)
             searches.append(result)
-            yield _aggregate_searches(searches, len(queries), warnings, identifiers)
+            snapshot = _aggregate_searches(searches, len(queries), warnings, identifiers)
+            diagnostic = next(row for row in snapshot["searches"] if row["plan_index"] == index)
+            accepted = diagnostic["supported_result_count"]
+            print("public_web_query " + json.dumps({
+                "query_type": query_info["type"], "query": query_info["query"],
+                "backend": SEARCH_BACKEND, "elapsed_seconds": elapsed,
+                "raw_result_count": raw_count, "accepted_result_count": accepted,
+                "filtered_result_count": raw_count - accepted, "status": result["status"],
+                "exception_class": exception_class, "exception_message": exception_message,
+            }), flush=True)
+            if raw_count == 0 and result["status"] == "no_results":
+                provider_empty += 1
+            if provider_empty == len(queries):
+                print(
+                    "All public-web queries returned zero provider results; "
+                    "possible provider blocking or cloud-IP limitation.",
+                    flush=True,
+                )
+            yield snapshot
 
 
 def search_identity(

@@ -1,12 +1,33 @@
 """Offline checks for the preserved public-web evidence pipeline."""
+import json
 import unittest
 from threading import Event, Lock
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+from ddgs.ddgs import DDGS
+from ddgs.results import TextResult
 
 from backend.web_search import build_queries, search_identity, search_identity_stream, search_query
 
 
 class PublicWebTests(unittest.TestCase):
+    def test_auto_backend_can_return_another_providers_results(self):
+        unavailable = Mock(provider="unavailable")
+        unavailable.search.side_effect = TimeoutError("timed out")
+        available = Mock(provider="available")
+        available.search.return_value = [
+            TextResult(title="Public project by jane123", href="https://example.com/jane123", body="jane123"),
+        ]
+        empty = Mock(provider="empty")
+        empty.search.return_value = []
+        with patch.object(DDGS, "_get_engines", return_value=[unavailable, available, empty]) as engines:
+            result = search_identity(username="jane123")
+        engines.assert_called_once_with("text", "auto")
+        unavailable.search.assert_called_once()
+        available.search.assert_called_once()
+        self.assertEqual(result["unique_result_count"], 1)
+        self.assertEqual(result["failed_queries"], 0)
+
     @patch("backend.web_search.DDGS")
     def test_username_only_runs_public_web_query_and_returns_candidate_pages(self, ddgs):
         ddgs.return_value.text.return_value = [
@@ -19,6 +40,8 @@ class PublicWebTests(unittest.TestCase):
         self.assertEqual(result["searches"][0]["query_type"], "username")
         self.assertEqual(result["results"][0]["query_types"], ["username"])
         self.assertEqual(ddgs.return_value.text.call_args.args, ('"jane123"',))
+        self.assertEqual(ddgs.return_value.text.call_args.kwargs["backend"], "auto")
+        self.assertEqual(result["results"][0]["search_engine"], "DDGS (auto)")
 
     @patch("backend.web_search.DDGS")
     def test_combined_inputs_search_each_identifier_and_cross_reference_handle(self, ddgs):
@@ -100,7 +123,7 @@ class PublicWebTests(unittest.TestCase):
         self.assertEqual(set(merged["query_types"]), {"full_name", "full_name_non_linkedin"})
         self.assertEqual(len(merged["queries"]), 2)
         for call in ddgs.return_value.text.call_args_list:
-            self.assertEqual(call.kwargs["backend"], "bing")
+            self.assertEqual(call.kwargs["backend"], "auto")
             self.assertEqual(call.kwargs["max_results"], 4)
 
     @patch("backend.web_search.DDGS")
@@ -143,6 +166,56 @@ class PublicWebTests(unittest.TestCase):
                 self.assertEqual(result["status"], "no_results")
                 self.assertEqual(result["results"], [])
                 self.assertNotIn("error", result)
+
+    @patch("backend.web_search.DDGS")
+    def test_query_log_counts_provider_rows_before_filtering(self, ddgs):
+        ddgs.return_value.text.return_value = [
+            {"title": "Jane", "href": "https://example.com/jane123"},
+            {"title": "Other", "href": "https://example.com/other"},
+            {"title": "Missing link"},
+        ]
+        with patch("builtins.print") as logged:
+            result = search_identity(username="jane123")
+        log = json.loads(logged.call_args_list[1].args[0].removeprefix("public_web_query "))
+        self.assertEqual(log["query_type"], "username")
+        self.assertEqual(log["query"], '"jane123"')
+        self.assertEqual(log["backend"], "auto")
+        self.assertEqual(log["raw_result_count"], 3)
+        self.assertEqual(log["accepted_result_count"], 1)
+        self.assertEqual(log["filtered_result_count"], 2)
+        self.assertEqual(log["status"], "success")
+        self.assertGreaterEqual(log["elapsed_seconds"], 0)
+        self.assertIsNone(log["exception_class"])
+        self.assertIn("ddgs_version=", logged.call_args_list[0].args[0])
+        self.assertEqual(result["filtered_result_count"], 1)
+        self.assertNotIn("elapsed_seconds", result["searches"][0])
+
+    @patch("backend.web_search.DDGS")
+    def test_all_empty_results_emit_log_only_and_preserve_no_results(self, ddgs):
+        ddgs.return_value.text.side_effect = RuntimeError("No results found.")
+        with patch("builtins.print") as logged:
+            result = search_identity(full_name="Jane Doe")
+        self.assertEqual(result["no_result_queries"], result["queries_total"])
+        self.assertEqual(result["failed_queries"], 0)
+        self.assertEqual(result["warnings"], [])
+        lines = [entry.args[0] for entry in logged.call_args_list]
+        self.assertEqual(sum(line.startswith("All public-web queries returned zero") for line in lines), 1)
+        query = json.loads(lines[1].removeprefix("public_web_query "))
+        self.assertEqual(query["raw_result_count"], 0)
+        self.assertEqual(query["status"], "no_results")
+        self.assertEqual(query["exception_class"], "RuntimeError")
+        self.assertEqual(query["exception_message"], "No results found.")
+
+    @patch("backend.web_search.DDGS")
+    def test_explicit_rate_limit_with_no_results_in_message_is_a_failure(self, ddgs):
+        ddgs.return_value.text.side_effect = RuntimeError("429: no results due to rate limiting")
+        with patch("builtins.print") as logged:
+            result = search_identity(username="jane123")
+        self.assertEqual(result["failed_queries"], 1)
+        self.assertEqual(result["no_result_queries"], 0)
+        log = json.loads(logged.call_args.args[0].removeprefix("public_web_query "))
+        self.assertEqual(log["status"], "rate_limited")
+        self.assertEqual(log["exception_class"], "RuntimeError")
 
     @patch("backend.web_search.DDGS")
     def test_invalid_phone_warns_and_is_never_submitted_as_a_query(self, ddgs):
