@@ -1,6 +1,6 @@
 # Digital Footprint Visualizer
 
-Use the project virtual environment (it contains the DDGS search dependency):
+Use the project virtual environment to install and run the app.
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -17,7 +17,9 @@ Site checks share a scan-scoped Requests connection pool and preloaded TLS trust
 
 `backend.analysis.analyze_identity_stream()` runs public-web search alongside username checking when a handle is supplied. Public-web search uses every supplied name, username, email, and valid phone identifier, plus name/location, name/username, and username/location combinations where available. Username-only searches use both WhatsMyName and public-web queries. Name-, email-, or phone-only searches use public-web search alone. A name may contain a single word; neither a handle nor a second name component is required. The app does not invent a username from a name or email.
 
-`backend.web_search.search_identity_stream()` runs up to three independent DDGS queries concurrently using automatic provider selection and yields an initial record and one update after each query completes. Name-only searches use eight query types: exact name, beyond LinkedIn, public PDFs, unquoted name, LinkedIn profiles, GitHub, profile/portfolio/biography pages, and social profiles. Optional details add more queries. `search_identity()` remains a blocking wrapper with compatible arguments.
+`backend.web_search.search_identity_stream()` runs up to three independent Tavily basic searches concurrently and yields an initial record and one update after each query completes. Name-only searches use eight query types: exact name, beyond LinkedIn, public PDFs, unquoted name, LinkedIn profiles, GitHub, profile/portfolio/biography pages, and social profiles. Optional details add more queries. `search_identity()` remains a blocking wrapper with compatible arguments.
+
+Set `TAVILY_API_KEY` in the server environment, the ignored `.streamlit/secrets.toml` file, or Streamlit Community Cloud Secrets. Use a top-level key in Streamlit secrets. The username scan remains available when the key is missing.
 
 Worker threads send data through a queue; only the Streamlit script thread updates the page. New username matches and public-web cards appear as checks and queries complete. Routine username progress refreshes every five completions or about 200 ms. The dedicated web loading card shows an animated indicator, actual searches completed versus planned, elapsed time, and candidate-page/domain counts; it does not pretend to count every site on the internet. An interrupted source preserves partial results and does not discard the other source. There is no stop button: active HTTP requests finish within the backend timeouts. Closing the page or rerunning the script is not a reliable cancellation mechanism.
 

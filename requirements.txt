@@ -35,4 +35,3 @@ urllib3==2.8.0
 uvicorn==0.54.0
 watchdog==6.0.0
 websockets==17.3
-ddgs==9.16.0

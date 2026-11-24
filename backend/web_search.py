@@ -1,21 +1,21 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 import json
+import os
 import re
 from time import perf_counter
 import unicodedata
 from urllib.parse import unquote, urlparse
 
-import ddgs
-from ddgs import DDGS
-from ddgs.exceptions import RatelimitException, TimeoutException
+import requests
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-SEARCH_BACKEND = "auto"
+SEARCH_BACKEND = "tavily"
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 DEFAULT_RESULTS_PER_QUERY = 10
 SEARCH_TIMEOUT = 12
 
@@ -234,61 +234,91 @@ def build_queries(
 # ERROR CLASSIFICATION
 # ============================================================
 
-def _classify_error(error):
-    """Recognize definite errors and DDGS's standard no-results response."""
-    error_text = str(error).strip().lower()
-    if isinstance(error, RatelimitException) or any(
-        hint in error_text for hint in ("429", "rate limit", "too many requests")
-    ):
-        return "rate_limited"
-    if isinstance(error, (TimeoutException, TimeoutError)) or any(
-        hint in error_text for hint in ("timeout", "timed out")
-    ):
-        return "timeout"
-    if error_text.rstrip(".") in {"no result", "no results", "no results found"}:
-        return "no_results"
-    return "error"
+def _get_tavily_api_key():
+    """Read the server-side key, including when Streamlit has not loaded secrets yet."""
+    key = os.environ.get("TAVILY_API_KEY", "").strip()
+    if key:
+        return key
 
+    from streamlit import secrets
+    from streamlit.errors import StreamlitSecretNotFoundError
 
-def _query_failure(error):
-    status = _classify_error(error)
-    result = {
-        "status": status, "result_count": 0, "results": [],
-        "exception_class": type(error).__name__, "exception_message": str(error),
-    }
-    if status != "no_results":
-        result["error"] = str(error)
-    return result
-
-
-def search_query(query, max_results=DEFAULT_RESULTS_PER_QUERY):
-    """Run one query through DDGS and record the provider response before filtering."""
-    started = perf_counter()
-    result = {"query": query, "raw_result_count": 0}
     try:
-        rows = list(DDGS(timeout=SEARCH_TIMEOUT).text(
-            query, region="us-en", safesearch="moderate",
-            max_results=max_results, backend=SEARCH_BACKEND,
-        ) or [])
+        key = secrets.get("TAVILY_API_KEY")
+    except StreamlitSecretNotFoundError:
+        return ""
+    return key.strip() if isinstance(key, str) else ""
+
+
+def _query_failure(error, api_key):
+    status = "provider_error"
+    if isinstance(error, (requests.Timeout, TimeoutError)):
+        status = "timeout"
+        reason = "Tavily request timed out."
+    elif isinstance(error, requests.HTTPError) and error.response is not None:
+        code = error.response.status_code
+        if code == 429:
+            status = "rate_limited"
+        # Provider error responses can contain request metadata. Keep only the status.
+        reason = f"Tavily returned HTTP {code}."
+    else:
+        reason = str(error)
+    if api_key:
+        reason = reason.replace(api_key, "[redacted]")
+    return {
+        "status": status, "result_count": 0, "results": [],
+        "error": reason, "exception_class": type(error).__name__, "exception_message": reason,
+    }
+
+
+def search_query(query, max_results=DEFAULT_RESULTS_PER_QUERY, *, api_key=None):
+    """Run one basic Tavily search and record the response before filtering."""
+    started = perf_counter()
+    if api_key is None:
+        api_key = _get_tavily_api_key()
+    result = {"query": query, "raw_result_count": 0, "result_count": 0, "results": []}
+    if not api_key:
+        return dict(result, status="missing_api_key", error="TAVILY_API_KEY is not configured.",
+                    elapsed_seconds=round(perf_counter() - started, 3))
+
+    limit = DEFAULT_RESULTS_PER_QUERY if max_results is None else max_results
+    try:
+        response = requests.post(
+            TAVILY_SEARCH_URL,
+            headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+            json={
+                "query": query, "search_depth": "basic", "max_results": min(limit, 20),
+                "include_answer": False, "include_raw_content": False,
+            },
+            timeout=SEARCH_TIMEOUT,
+            allow_redirects=False,
+        )
+        if 300 <= response.status_code < 400:
+            raise requests.HTTPError("Unexpected redirect from Tavily.", response=response)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+            raise ValueError("Tavily response did not contain a results list.")
+        rows = payload["results"]
         result["raw_result_count"] = len(rows)
         normalized_results = []
         for item in rows:
-            url = _clean(item.get("href", ""))
+            url = _clean(item.get("url", ""))
             if not url:
                 continue
             normalized_results.append({
                 "title": _clean(item.get("title", "")),
                 "url": url,
                 "domain": _get_domain(url),
-                "snippet": _clean(item.get("body", "")),
-                "search_engine": f"DDGS ({SEARCH_BACKEND})",
+                "snippet": _clean(item.get("content", "")),
+                "search_engine": SEARCH_BACKEND,
             })
         result.update(
             status="success" if normalized_results else "no_results",
             result_count=len(normalized_results), results=normalized_results,
         )
     except Exception as error:
-        result.update(_query_failure(error))
+        result.update(_query_failure(error, api_key))
     result["elapsed_seconds"] = round(perf_counter() - started, 3)
     return result
 
@@ -366,7 +396,7 @@ def _aggregate_searches(searches, queries_total, warnings, identifiers):
             if url not in unique_results:
                 unique_results[url] = {
                     "source": "Public Web Search",
-                    "search_engine": item.get("search_engine") or f"DDGS ({SEARCH_BACKEND})",
+                    "search_engine": item.get("search_engine") or SEARCH_BACKEND,
                     "title": item.get("title", ""), "url": url,
                     "domain": item.get("domain", ""), "snippet": item.get("snippet", ""),
                     "query_types": [search["query_type"]], "queries": [search["query"]],
@@ -388,7 +418,7 @@ def _aggregate_searches(searches, queries_total, warnings, identifiers):
     successful = sum(row["status"] == "success" for row in searches)
     empty = sum(row["status"] == "no_results" for row in searches)
     return deepcopy({
-        "source": "Public Web Search", "search_engine": f"DDGS ({SEARCH_BACKEND})",
+        "source": "Public Web Search", "search_engine": SEARCH_BACKEND,
         "queries_total": queries_total, "queries_completed": len(searches),
         "queries_run": len(searches), "queries_with_results": successful,
         "no_result_queries": empty, "failed_queries": len(searches) - successful - empty,
@@ -404,7 +434,7 @@ def search_identity_stream(
 ):
     """Yield an initial record and one record per concurrently completed query.
 
-    At most three independent DDGS searches run at once. Provider rows,
+    At most three independent Tavily searches run at once. Provider rows,
     including filtered rows, stay in search diagnostics. Supported pages are
     candidate evidence only; this gate never establishes account ownership.
     """
@@ -424,11 +454,12 @@ def search_identity_stream(
     yield _aggregate_searches(searches, len(queries), warnings, identifiers)
     if not queries:
         return
-    print(f"public_web_backend ddgs_version={ddgs.__version__} backend={SEARCH_BACKEND}", flush=True)
+    api_key = _get_tavily_api_key()
+    print(f"public_web_backend backend={SEARCH_BACKEND} search_depth=basic", flush=True)
     provider_empty = 0
     with ThreadPoolExecutor(max_workers=3, thread_name_prefix="public-web-query") as executor:
         futures = {
-            executor.submit(search_query, query_info["query"], max_results_per_query): (
+            executor.submit(search_query, query_info["query"], max_results_per_query, api_key=api_key): (
                 index, query_info, perf_counter(),
             )
             for index, query_info in enumerate(queries)
@@ -438,7 +469,7 @@ def search_identity_stream(
             try:
                 result = dict(future.result())
             except Exception as error:
-                result = _query_failure(error)
+                result = _query_failure(error, api_key)
             raw_count = result.pop("raw_result_count", result["result_count"])
             elapsed = result.pop("elapsed_seconds", round(perf_counter() - submitted, 3))
             exception_class = result.pop("exception_class", None)
@@ -448,19 +479,20 @@ def search_identity_stream(
             snapshot = _aggregate_searches(searches, len(queries), warnings, identifiers)
             diagnostic = next(row for row in snapshot["searches"] if row["plan_index"] == index)
             accepted = diagnostic["supported_result_count"]
+            logged_query = query_info["query"].replace(api_key, "[redacted]") if api_key else query_info["query"]
             print("public_web_query " + json.dumps({
-                "query_type": query_info["type"], "query": query_info["query"],
+                "query_type": query_info["type"], "query": logged_query,
                 "backend": SEARCH_BACKEND, "elapsed_seconds": elapsed,
                 "raw_result_count": raw_count, "accepted_result_count": accepted,
                 "filtered_result_count": raw_count - accepted, "status": result["status"],
                 "exception_class": exception_class, "exception_message": exception_message,
+                "error": result.get("error"),
             }), flush=True)
             if raw_count == 0 and result["status"] == "no_results":
                 provider_empty += 1
             if provider_empty == len(queries):
                 print(
-                    "All public-web queries returned zero provider results; "
-                    "possible provider blocking or cloud-IP limitation.",
+                    "All public-web queries returned zero Tavily results.",
                     flush=True,
                 )
             yield snapshot

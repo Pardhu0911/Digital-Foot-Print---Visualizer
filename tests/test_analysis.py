@@ -11,6 +11,23 @@ INPUTS = dict(full_name="Example Person", location="", email="", phone="")
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_missing_tavily_key_uses_public_web_failure_path_and_preserves_username_results(self):
+        profiles = {"sites_total": 1, "sites_checked": 1, "found_count": 1}
+        with patch("backend.web_search._get_tavily_api_key", return_value=""), patch(
+            "backend.web_search.requests.post"
+        ) as request, patch("backend.analysis.scan_username_stream", return_value=iter([profiles])):
+            final = list(analyze_identity_stream(INPUTS, "example"))[-1]
+        request.assert_not_called()
+        self.assertTrue(final["web_error"])
+        self.assertTrue(final["web_done"] and final["username_done"])
+        self.assertEqual(final["profiles"], profiles)
+        self.assertIsNone(final["username_error"])
+        web = final["web"]
+        self.assertEqual(web["failed_queries"], web["queries_total"])
+        self.assertEqual(web["queries_completed"], web["queries_total"])
+        self.assertEqual(web["no_result_queries"], 0)
+        self.assertTrue(all(row["status"] == "missing_api_key" for row in web["searches"]))
+
     def test_all_provider_queries_failed_preserves_username_results(self):
         web = {"queries_total": 2, "queries_completed": 2, "failed_queries": 2, "results": []}
         profiles = {"sites_total": 1, "sites_checked": 1, "found_count": 1}
