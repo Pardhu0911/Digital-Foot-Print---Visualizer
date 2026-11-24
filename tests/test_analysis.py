@@ -93,7 +93,7 @@ class AnalysisTests(unittest.TestCase):
         ) as profiles:
             final = list(analyze_identity_stream(inputs, "example"))[-1]
         web.assert_called_once_with(**inputs, username="example")
-        profiles.assert_called_once_with("example", max_sites=None, workers=20)
+        profiles.assert_called_once_with("example", max_sites=None, workers=None)
         self.assertTrue(final["web_requested"])
         self.assertTrue(final["username_requested"])
         self.assertEqual(final["profiles"]["sites_checked"], 126)

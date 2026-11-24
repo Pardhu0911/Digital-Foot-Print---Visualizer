@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Queue
 import time
 
-from backend.whatsmyname import DEFAULT_WORKERS, scan_username_stream
+from backend.whatsmyname import scan_username_stream
 
 
 def search_public_web(**inputs):
@@ -21,7 +21,7 @@ def search_public_web_stream(**inputs):
     yield from search_identity_stream(**inputs, max_results_per_query=10)
 
 
-def analyze_identity_stream(inputs, username="", max_sites=None, workers=DEFAULT_WORKERS):
+def analyze_identity_stream(inputs, username="", max_sites=None, workers=None):
     """Yield snapshots as either source changes, plus elapsed-time heartbeats.
 
     Source workers put messages into a queue. Only the caller renders the UI.

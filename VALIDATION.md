@@ -63,3 +63,28 @@ Browser screenshots are in `output/ui/`, including initial/combined-source previ
 A saved full scan recorded 691 sites in 119.97 seconds at the previous default of ten workers. The default has been raised to twenty through a shared `DEFAULT_WORKERS` constant used by both username scan APIs and the coordinator. Coverage, request timeouts, site classification, and streaming behavior are unchanged. Explicit worker overrides remain supported.
 
 All 40 regression tests and syntax checks for all 21 Python files pass after the adjustment. A controlled fixture with 200 equal-duration simulated I/O checks completed in 0.413 seconds with ten workers and 0.208 seconds with twenty, retaining all 200 outcomes. This confirms concurrency wiring and queueing improvements in the fixture; it is not a live-web speed guarantee. A new full live scan was not run for benchmarking, so actual improvement should be measured on the next normal scan.
+
+## Full username scan benchmark
+
+On November 23, 2026, the baseline and optimized scanner checked the same 690 active definitions using the synthetic handle `dfvbench9a7f31e4`. Each run used the same saved dataset. Possible, not-found, and uncertain counts summed to 690 in every run.
+
+| Scanner | Workers | Wall seconds | Possible matches | Not found | Could not verify | HTTP 429 | Request errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 20 | 100.120 | 0 | 368 | 322 | 5 | 8 |
+| Baseline | 20 | 101.859 | 1 | 370 | 319 | 5 | 8 |
+| Baseline | 20 | 111.998 | 0 | 367 | 323 | 6 | 8 |
+| Optimized | 20 | 22.499 | 1 | 370 | 319 | 6 | 6 |
+| Optimized | 30 | 18.277 | 1 | 368 | 321 | 6 | 6 |
+| Optimized | 40 | 15.043 | 0 | 368 | 322 | 7 | 6 |
+| Optimized | 50 | 15.164 | 0 | 370 | 320 | 6 | 6 |
+| Optimized | 60 | 13.980 | 1 | 369 | 320 | 6 | 6 |
+| Optimized | 40 | 14.760 | 1 | 367 | 322 | 7 | 6 |
+| Optimized | 40 | 15.674 | 1 | 370 | 319 | 6 | 6 |
+
+The baseline averaged 104.659 seconds, with a range of 100.120–111.998 seconds. The optimized default of 40 workers averaged 15.159 seconds, with a range of 14.760–15.674 seconds. At the same 20-worker setting the optimized scanner took 22.499 seconds. The synthetic handle returned zero or one possible match in both versions, and classification tests also covered known positive, negative, ambiguous, and timeout responses.
+
+Profiling attributed 1,982–2,215 cumulative worker seconds per baseline run to request execution, including TLS setup and response reads. Other site work, including classification, took about one cumulative worker second. On a matched 69-site profile at 40 workers, loading the default CA bundle once reduced CA bundle loads from 70 to 1 and process CPU time from 80.70 to 0.97 seconds. A controlled 690-site Streamlit fixture reduced live and final Markdown updates from 3,493 to 460 and their cumulative server-side rendering time from 0.656 to 0.070 seconds. Browser checks observed an early username card while the scan was still in progress.
+
+The first official dataset load took 0.984 seconds with the optimized scanner. A subsequent read from the 24-hour cache took about 11 microseconds. All 48 regression tests passed, and the production Streamlit health endpoint returned `ok`. In the live coordinator smoke check, three username checks finished in 3.19 seconds while ten public-web queries finished in 16.76 seconds. The saved evaluation JSON contained both timings, total elapsed time, and all username outcome counts.
+
+The repeatable benchmark is in `tests/benchmark_whatsmyname.py`. This workspace contains the dataset snapshot, baseline module, and raw per-site run records in `output/wmn-performance/`.

@@ -105,6 +105,22 @@ class FrontendTests(unittest.TestCase):
         self.stream.assert_called_once()
         self.assertEqual(len(self.records()), 1)
 
+    def test_live_updates_batch_counts_but_render_matches_immediately(self):
+        from app import render_live_scan
+
+        states = [
+            dict(username="jane", username_done=checked == 10, web_done=True, profiles={
+                "sites_total": 10, "sites_checked": checked, "found_count": int(checked >= 2),
+            })
+            for checked in range(11)
+        ]
+        with patch("app.monotonic", return_value=1), patch("app.render_username_source") as username, patch(
+            "app.render_web_source"
+        ) as web:
+            self.assertIs(render_live_scan(iter(states), {}), states[-1])
+        self.assertEqual([call.args[0]["profiles"]["sites_checked"] for call in username.call_args_list], [0, 2, 7, 10])
+        web.assert_called_once()
+
     def test_either_name_or_username_alone_starts_analysis(self):
         for name, username in (("Jane Doe", ""), ("", "jane")):
             with self.subTest(name=name, username=username):

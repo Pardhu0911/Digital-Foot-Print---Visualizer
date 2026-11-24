@@ -4,6 +4,7 @@ from collections import Counter
 from html import escape
 import json
 from pathlib import Path
+from time import monotonic
 from urllib.parse import urlsplit
 
 import streamlit as st
@@ -16,6 +17,8 @@ from backend.evaluation import (
 )
 
 ROOT = Path(__file__).resolve().parent
+PROGRESS_BATCH_SIZE = 5
+PROGRESS_REFRESH_SECONDS = 0.2
 
 
 def html(markup, target=None):
@@ -235,6 +238,38 @@ def render_sources(scan, slots, live=False):
     return candidates
 
 
+def render_live_scan(snapshots, slots):
+    """Refresh each source on its own schedule and show new profile matches immediately."""
+    last_username = last_web = None
+    username_refresh = web_refresh = 0
+    for scan in snapshots:
+        now = monotonic()
+        if scan.get("username_requested", bool(scan.get("username"))):
+            current = scan.get("profiles") or {}
+            previous = (last_username or {}).get("profiles") or {}
+            checked = current.get("sites_checked", 0)
+            if (
+                last_username is None
+                or current.get("found_count", 0) != previous.get("found_count", 0)
+                or current.get("sites_total") != previous.get("sites_total")
+                or scan["username_done"] != last_username["username_done"]
+                or scan["web_done"] != last_username["web_done"]
+                or checked - previous.get("sites_checked", 0) >= PROGRESS_BATCH_SIZE
+                or (not scan["username_done"] and now - username_refresh >= PROGRESS_REFRESH_SECONDS)
+            ):
+                render_username_source(scan, slots, live=True)
+                last_username, username_refresh = scan, now
+        if (
+            last_web is None
+            or scan.get("web") is not last_web.get("web")
+            or scan["web_done"] != last_web["web_done"]
+            or (not scan["web_done"] and now - web_refresh >= PROGRESS_REFRESH_SECONDS)
+        ):
+            render_web_source(scan, slots, live=True)
+            last_web, web_refresh = scan, now
+    return scan
+
+
 def render_summary(scan):
     profiles, web = scan.get("profiles") or {}, scan.get("web") or {}
     username_requested = scan.get("username_requested", bool(scan.get("username")))
@@ -391,8 +426,7 @@ def main():
         html('<p class="section-intro">Candidate pages from public search results. Confidence labels explain evidence strength, not verified ownership.</p>')
         slots.update({key: st.empty() for key in ("web_progress", "web_metrics", "web_notice", "web_cards")})
         if start_scan:
-            for scan in analyze_identity_stream(inputs, handle):
-                render_sources(scan, slots, live=True)
+            scan = render_live_scan(analyze_identity_stream(inputs, handle), slots)
             scan["evaluation"] = build_evaluation_summary(
                 web_results=scan["web"], web_elapsed=scan["web_elapsed"],
                 username_results=scan["profiles"], username_elapsed=scan["username_elapsed"],
